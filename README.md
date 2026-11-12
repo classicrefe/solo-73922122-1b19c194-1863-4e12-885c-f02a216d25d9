@@ -12,7 +12,7 @@ docker compose up --build
 
 | 入口 | 地址 |
 |---|---|
-| 演示 / 交互式 API 文档 | http://localhost:8000/docs |
+| 演示 / 交互式 API 文档 | http://localhost:8000/docs （恢复接口在 **recovery** 分组） |
 | 按样本查询当前结果 | http://localhost:8000/api/v1/samples/{样本号} |
 | 按 MSH-10 查询消息与原回执 | http://localhost:8000/api/v1/messages/{MSH-10} |
 | 样本列表 | http://localhost:8000/api/v1/samples |
@@ -62,6 +62,77 @@ docker compose exec lis python -m app.simulator --host 127.0.0.1 --port 2575 \
     --scenario concurrent --scenario dropped-ack
 ```
 
+## 接收库恢复（误写数据后回档再重采）
+
+仪器联调误写数据后，维护人员可上传本服务用 SQLite backup 生成的备份把
+接收库整体恢复到备份时刻，再让仪器重新采集。恢复过程不需要重启进程，原
+有接口全部保留。
+
+### 恢复接口（均在 `/docs` 的 recovery 分组）
+
+| 方法/路径 | 说明 |
+|---|---|
+| `GET /api/v1/admin/recovery/backup` | 用 SQLite 在线 backup API 下载当前库的一致性备份（单文件，无 WAL 旁挂文件） |
+| `POST /api/v1/admin/recovery/backups` | 上传备份到暂存目录并**离线校验**，上限 16 MiB；不合格返回 413/422 且不影响当前服务 |
+| `POST /api/v1/admin/recovery/commit?backup_id=` | 用已校验的暂存备份原子替换在线库 |
+| `GET /api/v1/admin/recovery/status` | 查询恢复阶段、在途作业、上次结果 |
+| `DELETE /api/v1/admin/recovery/backups/{backup_id}` | 放弃并删除暂存备份 |
+
+上传校验内容：SQLite 文件头、`PRAGMA integrity_check` 必须为 `ok`、只允许
+存在 `messages` 与 `results` 两张用户表且列定义与服务一致（名称/类型/
+NOT NULL/主键位置），并要求存在 `idx_results_sample` 索引。校验以
+`immutable` 只读方式打开，不会在上传文件旁生成 WAL，也不触碰在线库。
+
+### 切换时的保证
+
+1. 暂停接受**新 MLLP 连接**（监听 socket 关闭、端口保持占用），切换完成
+   后在同一端口重新监听；
+2. 数据查询接口（samples / messages / demo 文本）在切换期间返回 **503**，
+   `/health` 与恢复状态接口仍可用；
+3. 关闭全部**旧 MLLP 连接**，未到 FS 的残帧随连接丢弃，绝不写库；
+4. 等已经进入入库或查询的后台作业**真正结束**（作业栅栏跟踪到线程完成，
+   即使发起请求的 HTTP/MLLP 连接已断开）；
+5. 在存储写锁内整体替换数据库主文件与 WAL/SHM：结果、报文、原回执一起
+   回到备份时刻；候选备份自带的旧 WAL 会被删除，绝不混入恢复库；
+6. 替换后重新打开并再做一次 `integrity_check`；任何一步失败都把旧库移回
+   并继续用旧库服务，不会停留在维护状态；
+7. 同期只允许一次恢复，并发提交得到 409；提交任务与 HTTP 请求脱钩，请求
+   断连后切换或回退仍会执行完毕，可轮询 status 跟踪；
+8. 恢复后同一 MSH-10 重发按**备份中的记录**处理：原文一致回放备份里持久
+   化的原 ACK，原文不同仍回 AE；恢复库就是普通的在线库，重启后保留。
+
+### 一键演示
+
+容器内置纯标准库演示脚本，覆盖"可上传备份"与"慢入库时恢复"两条路径：
+
+```bash
+docker compose up --build
+# 终端 1：备份 → 误写 → 上传 → 恢复 → 同 ID 重放 → 非法上传被拒
+docker compose exec lis python -m app.recovery_demo \
+    --base-url http://127.0.0.1:8000 --mllp-host 127.0.0.1 --mllp-port 2575
+```
+
+慢入库演示（写事务故意持有 3 秒，验证切换会等在途作业结束、旧任务迟到
+数据不写入恢复库）：
+
+```bash
+docker compose --profile demo up --build
+docker compose exec lis-slow-demo python -m app.recovery_demo \
+    --scenario slow --base-url http://127.0.0.1:8000 \
+    --mllp-host 127.0.0.1 --mllp-port 2575
+```
+
+也可用 curl 手工执行：
+
+```bash
+curl -s http://localhost:8000/api/v1/admin/recovery/backup -o lis-backup.db
+curl -s -X POST http://localhost:8000/api/v1/admin/recovery/backups \
+    -F "file=@lis-backup.db;type=application/vnd.sqlite3"
+# 取响应里的 backup_id 后：
+curl -s -X POST "http://localhost:8000/api/v1/admin/recovery/commit?backup_id=<id>"
+curl -s http://localhost:8000/api/v1/admin/recovery/status
+```
+
 ## 行为约定
 
 ### 接收与 ACK
@@ -101,25 +172,32 @@ docker compose exec lis python -m app.simulator --host 127.0.0.1 --port 2575 \
 
 | 方法/路径 | 说明 |
 |---|---|
-| `GET /api/v1/samples/{sample}` | 当前结果（项目、值、单位、状态、来源 MSH-10、更新时间）及该样本已接纳消息列表 |
-| `GET /api/v1/samples?limit=` | 最近更新的样本及项目数 |
-| `GET /api/v1/messages/{msh10}` | 消息原文、原文摘要、ACK 代码、持久化的 ACK 原文 |
+| `GET /api/v1/samples/{sample}` | 当前结果（项目、值、单位、状态、来源 MSH-10、更新时间）及该样本已接纳消息列表；切换期间 503 |
+| `GET /api/v1/samples?limit=` | 最近更新的样本及项目数；切换期间 503 |
+| `GET /api/v1/messages/{msh10}` | 消息原文、原文摘要、ACK 代码、持久化的 ACK 原文；切换期间 503 |
 | `POST /api/v1/demo/messages` | 经真实 MLLP 发送（分片 / 丢回执重发） |
 | `POST /api/v1/demo/concurrent` | N 连接并发发送同一条消息 |
 | `GET /api/v1/demo/samples/{sample}` | 纯文本结果摘要 |
+| `GET /api/v1/admin/recovery/backup` | 下载在线一致性备份（SQLite backup API） |
+| `POST /api/v1/admin/recovery/backups` | 上传并校验备份（≤16 MiB），暂存不换库 |
+| `POST /api/v1/admin/recovery/commit` | 用暂存备份原子恢复在线库 |
+| `GET /api/v1/admin/recovery/status` | 恢复状态与在途作业 |
+| `DELETE /api/v1/admin/recovery/backups/{id}` | 删除暂存备份 |
 
 ## 本地开发与测试
 
 ```bash
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
-pytest                      # 55 项：解析、拒绝、F/C、并发、重启、分片/粘包、HTTP、demo
+pytest                      # 78 项：解析、拒绝、F/C、并发、重启、分片/粘包、HTTP、demo、恢复（23 项）
 ./run_local.sh              # http://localhost:8000/docs，MLLP 2575，库在 ./data/lis.db
 python -m app.simulator --host 127.0.0.1 --port 2575
+python -m app.recovery_demo # 备份恢复端到端演示（也可用 --scenario slow）
 ```
 
 环境变量：`LIS_DB_PATH`（默认 `/data/lis.db`）、`LIS_MLLP_HOST`（默认
-`0.0.0.0`）、`LIS_MLLP_PORT`（默认 `2575`）。
+`0.0.0.0`）、`LIS_MLLP_PORT`（默认 `2575`）、`LIS_SLOW_APPLY_DELAY`
+（演示用，秒，默认 0；>0 时每个写事务在提交前额外持有写锁该时长）。
 
 ## 设计取舍
 
@@ -131,3 +209,11 @@ python -m app.simulator --host 127.0.0.1 --port 2575
 * **指纹用规范化原文**：CR/LF 差异不算"异文"，其余任何字节差异都算。
 * **数值校验从严**：OBX-2 非 NM/SN、OBX-5 非数值都整条拒绝，避免 LIS
   里出现无法计算的结果。
+* **恢复两阶段、单写者换库**：上传阶段只写暂存目录并以只读 immutable
+  方式校验，与在线库完全隔离；提交阶段先暂停监听、关旧连接、经作业栅栏
+  排空在途入库/查询，再在 SQLite 写锁内用同文件系统 `os.replace` 整体换
+  库，失败即移回旧库。所有连接均为短连接，换库时没有任何打开的 SQLite
+  句柄，旧 WAL 在换库前折叠删除，候选备份的旁挂 WAL 也一律删除。
+* **断连不中断恢复**：提交任务通过 `asyncio.create_task` 与 HTTP 请求
+  脱钩，客户端断连后切换/回退仍执行完毕，`finally` 保证监听恢复与维护
+  状态清除；同一时刻用异步锁保证只允许一次恢复。

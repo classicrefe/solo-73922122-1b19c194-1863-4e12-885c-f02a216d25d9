@@ -13,5 +13,26 @@ services:
       - lis-data:/data
     restart: unless-stopped
 
+  # Optional second instance for the "recovery during a slow in-flight write"
+  # demo. It deliberately holds each writer transaction for 3 seconds so the
+  # maintenance window can be observed. Start it with:
+  #   docker compose --profile demo up --build
+  lis-slow-demo:
+    profiles: ["demo"]
+    build: .
+    container_name: lis-analyser-receiver-slow-demo
+    ports:
+      - "8001:8000"
+      - "2576:2575"
+    environment:
+      LIS_DB_PATH: /data/lis.db
+      LIS_MLLP_HOST: 0.0.0.0
+      LIS_MLLP_PORT: "2575"
+      LIS_SLOW_APPLY_DELAY: "3"
+    volumes:
+      - lis-slow-data:/data
+    restart: unless-stopped
+
 volumes:
   lis-data:
+  lis-slow-data:
